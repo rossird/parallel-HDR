@@ -79,45 +79,180 @@
 
 */
 
+
+#include "reference_calc.cpp"
 #include "utils.h"
+
+#define MIN_OP 1
+#define MAX_OP 2
+#define SUM_OP 3
 
 __device__ float min_float(float a, float b) {
     return a < b ? a : b;
 }
 
-//Calculate a min scan
-__global__
-void min_scan(float* array, int size, float* min) {
-    int i = threadIdx.x + blockIdx.x * blockDim.x;
-    
-    for (int offset = 1; offset < size; offset *= 2) {
-        if (i >= offset) {
-            array[i] = min_float(array[i - offset], array[i]);
-        }
-    }
-    
-    //*min = array[size-1];
-
+__device__ float max_float(float a, float b) {
+    return a < b ? b : a;
 }
 
-//Calculate a max scan
-__global__
-void max_scan(const float* array, size_t size, float* max) {
+//Taken from blackboard
+__global__ void global_reduce_kernel(float * d_out, float * d_in, int REDUCE_OP)
+{
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    int tid  = threadIdx.x;
 
+    // do reduction in global mem
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            switch(REDUCE_OP) {
+                case MIN_OP:
+                    d_in[myId] = min_float(d_in[myId], d_in[myId + s]);
+                    break;
+                case MAX_OP:
+                    d_in[myId] = max_float(d_in[myId], d_in[myId + s]);
+                    break;
+                case SUM_OP:
+                    d_in[myId] += d_in[myId + s];
+                    break;
+            }
+        }
+        __syncthreads();        // make sure all adds at one stage are done!
+    }
+
+    // only thread 0 writes result for this block back to global mem
+    if (tid == 0)
+    {
+        d_out[blockIdx.x] = d_in[myId];
+    }
+}
+
+//Taken from blackboard
+//Hillis & Steele: Kernel Function
+//Altered by Jake Heath, October 8, 2013 (c)
+__global__ 
+	 void scanKernel(unsigned int *out_data, unsigned int *in_data, size_t numElements){
+	 	//we are creating an extra space for every numElement so the size of the array needs to be 2*numElements
+	 	//cuda does not like dynamic array in shared memory so it might be necessary to explicitly state
+	 	//the size of this mememory allocation
+	 	__shared__ int temp[1024 * 2]; 
+
+	 	//instantiate variables
+		int id = threadIdx.x;
+		int pout = 0, pin = 1;
+
+		// // load input into shared memory. 
+		// // Exclusive scan: shift right by one and set first element to 0
+		temp[id] = (id > 0) ? in_data[id - 1] : 0;
+		__syncthreads();
+		
+
+		//for each thread, loop through each of the steps
+		//each step, move the next resultant addition to the thread's 
+		//corresponding space to manipulted for the next iteration
+		for( int offset = 1; offset < numElements; offset <<= 1 ){
+			//these switch so that data can move back and fourth between the extra spaces
+			pout = 1 - pout; 
+			pin = 1 - pout;
+
+			//IF: the number needs to be added to something, make sure to add those contents with the contents of 
+				//the element offset number of elements away, then move it to its corresponding space
+			//ELSE: the number only needs to be dropped down, simply move those contents to its corresponding space
+			if (id >= offset) {
+				//this element needs to be added to something; do that and copy it over
+				temp[pout * numElements + id] = temp[pin * numElements + id] + temp[pin * numElements + id - offset]; 
+			} else {
+				 //this element just drops down, so copy it over
+			    temp[pout * numElements + id] = temp[pin * numElements + id];
+			}
+		 	__syncthreads();
+		}
+		// write output
+		out_data[id] = temp[pout * numElements + id]; 
+	}//scanKernel
+
+__global__ void shmem_reduce_kernel(float * d_out, const float * d_in, int REDUCE_OP)
+{
+    // sdata is allocated in the kernel call: 3rd arg to <<<b, t, shmem>>>
+    extern __shared__ float sdata[];
+
+    int myId = threadIdx.x + blockDim.x * blockIdx.x;
+    int tid  = threadIdx.x;
+
+    // load shared mem from global mem
+    sdata[tid] = d_in[myId];
+    __syncthreads();            // make sure entire block is loaded!
+
+    // do reduction in shared mem
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1)
+    {
+        if (tid < s)
+        {
+            switch(REDUCE_OP) {
+                case MIN_OP:
+                    sdata[tid] = min_float(sdata[tid], sdata[tid + s]);
+                    break;
+                case MAX_OP:
+                    sdata[tid] = max_float(sdata[tid], sdata[tid + s]);
+                    break;
+                case SUM_OP:
+                    sdata[tid] += sdata[tid + s];
+                    break;
+            }
+            sdata[tid] += sdata[tid + s];
+        }
+        __syncthreads();        // make sure all adds at one stage are done!
+    }
+
+    // only thread 0 writes result for this block back to global mem
+    if (tid == 0)
+    {
+        d_out[blockIdx.x] = sdata[0];
+    }
+}
+
+void reduce(float * d_out, float * d_intermediate, float * d_in, 
+            int size, bool usesSharedMemory, int REDUCE_OP)
+{
+    // assumes that size is not greater than maxThreadsPerBlock^2
+    // and that size is a multiple of maxThreadsPerBlock
+    const int maxThreadsPerBlock = 384;
+    int threads = maxThreadsPerBlock;
+    int blocks = size / maxThreadsPerBlock;
+    if (usesSharedMemory)
+    {
+        shmem_reduce_kernel<<<blocks, threads, threads * sizeof(float)>>>
+            (d_intermediate, d_in, REDUCE_OP);
+    }
+    else
+    {
+        global_reduce_kernel<<<blocks, threads>>>
+            (d_intermediate, d_in, REDUCE_OP);
+    }
+    // now we're down to one block left, so reduce it
+    threads = blocks; // launch one thread for each block in prev step
+    blocks = 1;
+    if (usesSharedMemory)
+    {
+        shmem_reduce_kernel<<<blocks, threads, threads * sizeof(float)>>>
+            (d_out, d_intermediate, REDUCE_OP);
+    }
+    else
+    {
+        global_reduce_kernel<<<blocks, threads>>>
+            (d_out, d_intermediate, REDUCE_OP);
+    }
 }
 
 //Calculate a histogram
 __global__
-void histogram(const float* const lum, float lumMin, float lumRange, size_t numBins, int* histogram) {
+void histogram(const float* const lum, float lumMin, float lumRange, 
+               size_t numBins, unsigned int* histogram) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
     int bin = (lum[i] - lumMin) / lumRange * numBins;
+    //bin = min(bin, static_cast<int>(numBins - 1));
     atomicAdd(&histogram[bin], 1);
-}
-
-//Calculate an exclusive scan
-__global__
-void exclusive_scan(float* input, size_t size, unsigned int* const cdf) {
-
 }
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
@@ -139,40 +274,68 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
        the cumulative distribution of luminance values (this should go in the
        incoming d_cdf pointer which already has been allocated for you)       */
     
-    int* d_histogram;
-    float* d_max;
-    float* d_min;
-    float* d_temp;
+    unsigned int* d_histogram;
+    float* d_in;
+    float* d_intermediate;
+    float* d_out;
     float range;
     
     //Allocate memory
-    checkCudaErrors(cudaMalloc(&d_max, sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_min, sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_histogram, sizeof(int) * numBins));
-    checkCudaErrors(cudaMalloc(&d_temp, sizeof(float) * numCols * numRows));
+    checkCudaErrors(cudaMalloc(&d_in, sizeof(float) * numCols * numRows * 2));
+    checkCudaErrors(cudaMalloc(&d_intermediate, sizeof(float) * numCols * numRows * 2));
+    checkCudaErrors(cudaMalloc(&d_out, sizeof(float)));
     
     //Initialize memory
+    checkCudaErrors(cudaMemset(d_in, 0, sizeof(float) * numCols * numRows * 2));
+    checkCudaErrors(cudaMemcpy(d_in, d_logLuminance, sizeof(float) * numCols * numRows, cudaMemcpyDeviceToDevice));
+    checkCudaErrors(cudaMemset(d_intermediate, 0, sizeof(float) * numCols * numRows * 2));
+    checkCudaErrors(cudaMemset(d_out, 0, sizeof(float)));
     checkCudaErrors(cudaMemset(d_histogram, 0, sizeof(int) * numBins));
-    checkCudaErrors(cudaMemcpy(d_temp, d_logLuminance, sizeof(float) * numCols * numRows, cudaMemcpyDeviceToDevice));
     
     //Min scan to find min_logSum
-    min_scan<<<numRows, numCols>>>(d_temp, numCols * numRows, d_min);
-    //checkCudaErrors(cudaMemcpy(&min_logLum, d_min, sizeof(float), cudaMemcpyDeviceToHost));
+    reduce(d_out,
+           d_intermediate,
+           d_in,
+           numCols * numRows,
+           false,
+           MIN_OP);
+           
+    checkCudaErrors(cudaMemcpy(&min_logLum, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+
+    //Initialize memory
+    checkCudaErrors(cudaMemset(d_in, 0, sizeof(float) * numCols * numRows * 2));
+    checkCudaErrors(cudaMemcpy(d_in, d_logLuminance, sizeof(float) * numCols * numRows, cudaMemcpyDeviceToDevice));
+    checkCudaErrors(cudaMemset(d_intermediate, 0, sizeof(float) * numCols * numRows * 2));
+    checkCudaErrors(cudaMemset(d_out, 0, sizeof(float)));
     
     //Max scan to find max_logSum
-    //max_scan<<<numCols, numRows>>>(d_logLuminance, numCols * numRows, d_max);
-    //checkCudaErrors(cudaMemcpy(&max_logLum, d_max, sizeof(float), cudaMemcpyDeviceToHost));
-    
+    reduce(d_out,
+           d_intermediate,
+           d_in,
+           numCols * numRows * 2,
+           false,
+           MAX_OP);
+         
+    checkCudaErrors(cudaMemcpy(&max_logLum, d_out, sizeof(float), cudaMemcpyDeviceToHost));
+     
     //Find range
     range = max_logLum - min_logLum;
     
     //Generate histogram
-    //histogram<<<numCols, numRows>>>(d_logLuminance, min_logLum, range, numBins, d_histogram);
+    histogram<<<numCols, numRows>>>(d_logLuminance,
+                                    min_logLum,
+                                    range,
+                                    numBins,
+                                    d_histogram);
     
     //Exclusive scan to find cdf
-    //exclusive_scan<<<numCols, numRows>>>(d_logLuminance, numCols * numRows,  d_cdf);
-    
-    //free(d_max);
-    //free(d_min);
-    //free(d_histogram);
+    scanKernel<<<1, numBins>>>(d_cdf, 
+                               d_histogram,
+                               numBins);
+
+    cudaFree(d_in);
+    cudaFree(d_intermediate);
+    cudaFree(d_out);
+    cudaFree(d_histogram);
 }
